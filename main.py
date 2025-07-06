@@ -20,9 +20,6 @@ CONFIG = {
     # 时区配置 (东八区为+8)
     "timezone": 8,
     
-    # 结果转发群号 (None表示不转发)
-    "report_group_id": 838116737,  # 例如 "123456789"
-    
     # 持久化存储文件路径
     "storage_file": str(PLUGIN_ROOT / "group_sign_data.json")
 }
@@ -179,23 +176,6 @@ class GroupSignPlugin(Star):
         
         return "\n".join(results)
 
-    async def _send_to_target_group(self, message: str):
-        """直接发送消息到配置的目标群"""
-        if not CONFIG["report_group_id"]:
-            return
-    
-        try:
-            # 使用最基础的API发送消息
-            target_group = str(CONFIG["report_group_id"])
-            await self.context.bot.send_group_msg(
-                group_id=target_group,
-                message=message
-            )
-        except Exception as e:
-            logger.error(f"发送消息到群 {target_group} 失败: {e}")
-    
-    
-
     async def _daily_sign_task(self):
         """每日定时签到任务"""
         while not self._stop_event.is_set():
@@ -219,12 +199,7 @@ class GroupSignPlugin(Star):
                    break
                    
                 logger.info("开始执行每日签到...")
-                for group_id in self.group_ids:
-                    result = await self._send_sign_request(group_id)
-                    report_msg = (f"⏰ 每日签到\n群 {group_id}: " + 
-                                ("成功" if result["success"] else f"失败 - {result['message']}"))
-                await self._send_to_target_group(report_msg)
-
+                await self._sign_all_groups()
                 await asyncio.sleep(1)
 
             except asyncio.TimeoutError:
@@ -232,7 +207,6 @@ class GroupSignPlugin(Star):
             except Exception as e:
                 logger.error(f"自动签到出错: {e}")
             await asyncio.sleep(300)
-    
     
 
     @filter.command("debug_sign")
@@ -250,6 +224,7 @@ class GroupSignPlugin(Star):
         else:
             self.debug_mode = not self.debug_mode
             yield event.chain_result([Plain(f"🔧 Debug模式已{'开启' if self.debug_mode else '关闭'}")])
+
     @filter.command("sign_start")
     async def start_auto_sign(self, event: AstrMessageEvent, group_ids: str = None):
         """启动自动签到服务
@@ -338,17 +313,11 @@ class GroupSignPlugin(Star):
         # 确保所有群号都转为字符串
         group_ids_str = ', '.join(str(gid) for gid in self.group_ids) if self.group_ids else '无'
         
-        # 确保转发群号是字符串
-        report_group = f"群 {CONFIG['report_group_id']}" if CONFIG['report_group_id'] else '不转发'
-        if CONFIG['report_group_id'] and isinstance(CONFIG['report_group_id'], int):
-            report_group = f"群 {str(CONFIG['report_group_id'])}"
-        
         message = [
             Plain(f"{status}\n"),
             Plain(f"⏰ 签到时间: 每天 {CONFIG['sign_time'].strftime('%H:%M')} (UTC+{CONFIG['timezone']})\n"),
             Plain(f"🔗 目标URL: {self.base_url}\n"),
             Plain(f"👥 群号列表: {group_ids_str}\n"),
-            Plain(f"📨 结果转发: {report_group}\n"),
             Plain(f"⏱ 下次执行: {next_run}\n"),
             Plain(f"🔧 Debug模式: {'开启' if self.debug_mode else '关闭'}")
         ]
@@ -415,20 +384,11 @@ class GroupSignPlugin(Star):
             # 2. 开始处理提示
             yield event.chain_result([Plain("🔄 正在处理签到请求...")])
     
-            # 3. 收集所有结果
-            all_results = []
+            # 3. 发送每个结果
             for group_id in target_groups:
                 result = await self._send_sign_request(group_id)
                 status = "✅ 成功" if result["success"] else f"❌ 失败: {result['message']}"
-                result_msg = f"群 {group_id} 签到{status}"
-                all_results.append(result_msg)
-                
-                # 立即返回每个结果
-                yield event.chain_result([Plain(result_msg)])
-    
-            # 4. 合并发送完整结果（可选）
-            full_report = "签到完成:\n" + "\n".join(all_results)
-            yield event.chain_result([Plain(full_report)])
+                yield event.chain_result([Plain(f"群 {group_id} 签到{status}")])
     
         except Exception as e:
             error_msg = f"❌ 处理异常: {str(e)}"
