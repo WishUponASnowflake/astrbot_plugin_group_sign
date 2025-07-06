@@ -19,7 +19,7 @@ CONFIG = {
     "storage_file": "data.json"  # 数据存储路径
 }
 ```
-
+```
 ## 命令列表
 
 ### 基础操作
