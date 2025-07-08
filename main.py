@@ -31,21 +31,25 @@ class GroupSignPlugin(Star):
         super().__init__(context)
         self.task = None
         self.base_url = "http://192.168.1.50:3000/send_group_sign"
-        self.group_ids = self._load_group_ids()  # 从文件加载群号
+        self.group_ids = []  # 初始化空列表，将在_load_config中填充
         self.headers = {
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
-        self.is_active = False
+        self.is_active = False  # 初始状态，将在_load_config中覆盖
         self.debug_mode = False
         self._stop_event = asyncio.Event()
         
         # 初始化时区
         self.timezone = timedelta(hours=CONFIG["timezone"])
+        
+        # 加载配置
+        self._load_config()
+        
         logger.info(f"插件初始化完成，当前配置: {CONFIG}")
 
-    def _load_group_ids(self) -> List[Union[str, int]]:
-        """从文件加载持久化的群号列表"""
+    def _load_config(self):
+        """从文件加载持久化的配置"""
         try:
             # 确保目录存在
             os.makedirs(PLUGIN_ROOT, exist_ok=True)
@@ -53,27 +57,48 @@ class GroupSignPlugin(Star):
             if os.path.exists(CONFIG["storage_file"]):
                 with open(CONFIG["storage_file"], "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    return data.get("group_ids", [])
+                    self.group_ids = data.get("group_ids", [])
+                    self.is_active = data.get("is_active", False)
+                    
+                    # 如果之前是活跃状态，则启动任务
+                    if self.is_active:
+                        asyncio.create_task(self._start_sign_task())
             else:
                 # 文件不存在时创建空文件
-                with open(CONFIG["storage_file"], "w", encoding="utf-8") as f:
-                    json.dump({"group_ids": []}, f)
-                return []
+                self._save_config()
         except Exception as e:
-            logger.error(f"加载群号列表失败: {e}")
-            return []
+            logger.error(f"加载配置失败: {e}")
+            # 使用默认值
+            self.group_ids = []
+            self.is_active = False
     
-    def _save_group_ids(self):
-        """保存群号列表到文件"""
+    def _save_config(self):
+        """保存配置到文件"""
         try:
             # 确保目录存在
             os.makedirs(PLUGIN_ROOT, exist_ok=True)
             
+            data = {
+                "group_ids": self.group_ids,
+                "is_active": self.is_active
+            }
+            
             with open(CONFIG["storage_file"], "w", encoding="utf-8") as f:
-                json.dump({"group_ids": self.group_ids}, f, ensure_ascii=False, indent=2)
-            logger.info(f"群号列表已保存到: {CONFIG['storage_file']}")
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            logger.info(f"配置已保存到: {CONFIG['storage_file']}")
         except Exception as e:
-            logger.error(f"保存群号列表失败: {e}")
+            logger.error(f"保存配置失败: {e}")
+
+    async def _start_sign_task(self):
+        """启动签到任务"""
+        if self.is_active:
+            self._stop_event.clear()
+            self.task = asyncio.create_task(self._daily_sign_task())
+            logger.info("自动签到任务已启动")
+
+    def _get_local_time(self) -> datetime:
+        """获取带时区的当前时间"""
+        return datetime.utcnow() + self.timezone
     
 
     def _get_local_time(self) -> datetime:
@@ -178,37 +203,48 @@ class GroupSignPlugin(Star):
 
     async def _daily_sign_task(self):
         """每日定时签到任务"""
-        while not self._stop_event.is_set():
-            now = self._get_local_time()
-            target_time = now.replace(
-                hour=CONFIG["sign_time"].hour,
-                minute=CONFIG["sign_time"].minute,
-                second=0,
-                microsecond=0
-            )
+        logger.info("每日签到任务已启动")
         
-            if now > target_time:
-                target_time += timedelta(days=1)
-
-            wait_seconds = (target_time - now).total_seconds()
-            logger.info(f"等待下次签到时间: {wait_seconds:.1f}秒")
-
+        while not self._stop_event.is_set():
             try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=wait_seconds)
-                if self._stop_event.is_set():
-                   break
-                   
+                now = self._get_local_time()
+                
+                # 计算今天的签到时间
+                target_time = now.replace(
+                    hour=CONFIG["sign_time"].hour,
+                    minute=CONFIG["sign_time"].minute,
+                    second=0,
+                    microsecond=0
+                )
+                
+                # 如果今天的时间已过，计算明天的时间
+                if now >= target_time:
+                    target_time += timedelta(days=1)
+                
+                wait_seconds = (target_time - now).total_seconds()
+                logger.info(f"距离下次签到还有 {wait_seconds:.1f}秒 (将在 {target_time} 执行)")
+                
+                # 等待到目标时间或收到停止信号
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=wait_seconds)
+                    if self._stop_event.is_set():
+                        break
+                except asyncio.TimeoutError:
+                    pass  # 正常到达目标时间
+                
+                # 执行签到
                 logger.info("开始执行每日签到...")
-                await self._sign_all_groups()
+                result = await self._sign_all_groups()
+                logger.info(f"签到完成: {result}")
+                
+                # 短暂延迟防止CPU占用过高
                 await asyncio.sleep(1)
-
-            except asyncio.TimeoutError:
-               continue
+                
             except Exception as e:
-                logger.error(f"自动签到出错: {e}")
-            await asyncio.sleep(300)
+                logger.error(f"自动签到任务出错: {e}")
+                # 出错后等待一段时间再重试
+                await asyncio.sleep(60)
     
-
     @filter.command("debug_sign")
     async def toggle_debug_mode(self, event: AstrMessageEvent, mode: str = None):
         """开启/关闭debug模式"""
@@ -227,11 +263,7 @@ class GroupSignPlugin(Star):
 
     @filter.command("sign_start")
     async def start_auto_sign(self, event: AstrMessageEvent, group_ids: str = None):
-        """启动自动签到服务
-        
-        参数:
-            group_ids - (可选)群号列表，用逗号分隔。不提供则使用已有群号或全局设置
-        """
+        """启动自动签到服务"""
         try:
             # 如果有提供群号，则更新群号列表
             if group_ids:
@@ -249,20 +281,18 @@ class GroupSignPlugin(Star):
                     return
                     
                 self.group_ids = new_groups
-                self._save_group_ids()
+            
             # 如果没有提供群号且当前没有配置群号
             elif not self.group_ids:
                 yield event.chain_result([Plain("ℹ️ 当前没有配置任何群号，请先添加群号")])
                 return
             
-            # 启动/重启任务
-            if self.is_active:
-                self._stop_event.set()
-                await asyncio.sleep(1)  # 等待任务停止
-                
-            self._stop_event.clear()
-            self.task = asyncio.create_task(self._daily_sign_task())
+            # 更新状态并保存
             self.is_active = True
+            self._save_config()
+            
+            # 启动任务
+            await self._start_sign_task()
             
             next_run = (self._get_local_time().replace(
                 hour=CONFIG["sign_time"].hour,
@@ -289,6 +319,8 @@ class GroupSignPlugin(Star):
         if self.is_active:
             self._stop_event.set()
             self.is_active = False
+            self._save_config()  # 保存状态
+            
             if self.task:
                 self.task.cancel()
                 try:
@@ -401,6 +433,8 @@ class GroupSignPlugin(Star):
         if self.is_active:
             self._stop_event.set()
             self.is_active = False
+            self._save_config()  # 终止前保存状态
+            
             if self.task:
                 self.task.cancel()
                 try:
