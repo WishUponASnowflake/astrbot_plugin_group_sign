@@ -1,220 +1,203 @@
 from pathlib import Path
 from datetime import datetime, time, timedelta, timezone
 import aiohttp
+import aiofiles
 import json
 import asyncio
 import os
-from typing import List, Union, Optional
+from typing import List, Union, Optional, AsyncGenerator
 from urllib.parse import urlparse
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 from astrbot.api.message_components import Plain
 from astrbot.api import logger
 
 # ============= 可配置参数 =============
 PLUGIN_ROOT = Path(__file__).parent
 CONFIG = {
-    # 每日签到时间 (24小时制)
-    "sign_time": time(0, 0, 5),  # 默认中午12点
-    
-    # 时区配置 (东八区为+8)
+    "sign_time": time(0, 0, 5),  # 包含5秒延迟
     "timezone": 8,
-    
-    # 持久化存储文件路径
-    "storage_file": str(PLUGIN_ROOT / "group_sign_data.json")
+    "storage_file": str(PLUGIN_ROOT / "group_sign_data.json"),
+    "request_timeout": 10,
+    "retry_delay": 60,
+    "host":"192.168.1.50:3000"
 }
 
-# ============= 插件主类 =============
-@register("group_sign", "mmyddd", "群签到插件", "1.1.0")
 class GroupSignPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        self.task = None
-        self.base_url = "http://192.168.1.50:3000/send_group_sign"
-        self.group_ids = []  # 初始化空列表，将在_load_config中填充
+        self.task: Optional[asyncio.Task] = None
+        self.base_url = "http://"+CONFIG["host"]+"/send_group_sign"
+        self.group_ids: List[Union[str, int]] = []
         self.headers = {
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
-        self.is_active = False  # 初始状态，将在_load_config中覆盖
+        self.is_active = False
         self.debug_mode = False
         self._stop_event = asyncio.Event()
-        
-        # 初始化时区
         self.timezone = timezone(timedelta(hours=CONFIG["timezone"]))
+        self._session: Optional[aiohttp.ClientSession] = None
         
-        # 加载配置
-        self._load_config()
-        
+        asyncio.create_task(self._async_init())
+
+    async def _async_init(self):
+        """异步初始化"""
+        await self._load_config()
         logger.info(f"插件初始化完成，当前配置: {CONFIG}")
 
-    def _load_config(self):
-        """从文件加载持久化的配置"""
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """获取或创建ClientSession"""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def _load_config(self):
+        """异步加载配置"""
         try:
-            # 确保目录存在
             os.makedirs(PLUGIN_ROOT, exist_ok=True)
             
             if os.path.exists(CONFIG["storage_file"]):
-                try:
-                    with open(CONFIG["storage_file"], "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                        # 确保只更新存在的字段，保留其他字段不变
-                        if "group_ids" in data:
-                            self.group_ids = data["group_ids"]
-                        if "is_active" in data:  # 只有配置中存在时才更新
-                            self.is_active = data["is_active"]
-                        # 如果文件存在但缺少字段，不重置为默认值
-                except json.JSONDecodeError:
-                    logger.warning("配置文件格式错误，将使用默认值")
-                    # 这里可以选择不重置is_active，或者创建备份
-                    self._save_config()  # 重新保存当前配置
+                async with aiofiles.open(CONFIG["storage_file"], "r", encoding="utf-8") as f:
+                    data = json.loads(await f.read())
+                    if "group_ids" in data:
+                        self.group_ids = data["group_ids"]
+                    if "is_active" in data:
+                        self.is_active = data["is_active"]
             else:
-                # 文件不存在时才初始化默认值
                 self.group_ids = []
                 self.is_active = True
-                self._save_config()
+                await self._save_config()
                 
-            logger.info(f"加载配置完成: group_ids={self.group_ids}, is_active={self.is_active}")
+            logger.info(f"配置加载完成: group_ids={self.group_ids}, is_active={self.is_active}")
+            
+            if self.is_active:
+                await self._start_sign_task()
                 
         except Exception as e:
             logger.error(f"加载配置失败: {e}")
-            # 这里不再重置默认值，保持当前状态
-    
-    
-    def _save_config(self):
-        """保存配置到文件"""
+
+    async def _save_config(self):
+        """异步保存配置"""
         try:
-            # 确保目录存在
             os.makedirs(PLUGIN_ROOT, exist_ok=True)
-            
             data = {
                 "group_ids": self.group_ids,
                 "is_active": self.is_active
             }
-            
-            with open(CONFIG["storage_file"], "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            async with aiofiles.open(CONFIG["storage_file"], "w", encoding="utf-8") as f:
+                await f.write(json.dumps(data, ensure_ascii=False, indent=2))
             logger.info(f"配置已保存到: {CONFIG['storage_file']}")
         except Exception as e:
             logger.error(f"保存配置失败: {e}")
 
     async def _start_sign_task(self):
         """启动签到任务"""
-        if self.is_active:
+        if self.is_active and (self.task is None or self.task.done()):
             self._stop_event.clear()
             self.task = asyncio.create_task(self._daily_sign_task())
             logger.info("自动签到任务已启动")
 
     def _get_local_time(self) -> datetime:
-        """获取带时区的当前时间"""
         return datetime.now(self.timezone)
-    
-    
-    async def _send_sign_request(self, group_id: Union[str, int]):
-        """发送签到请求的核心方法"""
-        try:
-            post_data = {"group_id": str(group_id)}
-            
-            logger.debug(f"发送签到请求到 {self.base_url}，数据: {json.dumps(post_data)}")
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url=self.base_url,
-                    json=post_data,
-                    headers=self.headers,
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as response:
-                    raw_headers = "\n".join([f"{k}: {v}" for k, v in response.headers.items()])
-                    raw_content = await response.text()
-                    
-                    if response.status != 200:
-                        error_msg = f"HTTP状态码异常: {response.status} {response.reason}"
-                        return {
-                            "success": False,
-                            "status_code": response.status,
-                            "message": error_msg,
-                            "raw_response": f"HTTP/{response.version.major}.{response.version.minor} {response.status} {response.reason}\n{raw_headers}\n\n{raw_content}" if self.debug_mode else None
-                        }
-                    
-                    try:
-                        json_data = json.loads(raw_content)
-                        if not isinstance(json_data, dict):
-                            raise ValueError("响应不是JSON对象")
-                            
-                        required_fields = ["status", "retcode"]
-                        for field in required_fields:
-                            if field not in json_data:
-                                raise ValueError(f"缺少必要字段: {field}")
-                                
-                        formatted_response = (
-                            f"HTTP/{response.version.major}.{response.version.minor} {response.status} {response.reason}\n"
-                            f"{raw_headers}\n\n"
-                            f"{json.dumps(json_data, indent=2, ensure_ascii=False)}"
-                        )
-                        
-                        return {
-                            "success": True,
-                            "status_code": response.status,
-                            "data": json_data,
-                            "raw_response": formatted_response if self.debug_mode else None
-                        }
-                        
-                    except (json.JSONDecodeError, ValueError) as e:
-                        error_msg = f"响应解析失败: {str(e)}"
-                        return {
-                            "success": False,
-                            "status_code": response.status,
-                            "message": error_msg,
-                            "raw_response": f"HTTP/{response.version.major}.{response.version.minor} {response.status} {response.reason}\n{raw_headers}\n\n{raw_content}" if self.debug_mode else None
-                        }
+
+    async def _send_sign_request(self, group_id: Union[str, int]) -> dict:
+        """发送异步签到请求"""
+        post_data = {"group_id": str(group_id)}
+        logger.debug(f"发送签到请求到 {self.base_url}，数据: {json.dumps(post_data)}")
         
+        try:
+            session = await self._get_session()
+            async with session.post(
+                url=self.base_url,
+                json=post_data,
+                headers=self.headers,
+                timeout=aiohttp.ClientTimeout(total=CONFIG["request_timeout"])
+            ) as response:
+                raw_content = await response.text()
+                
+                if response.status != 200:
+                    error_msg = f"HTTP状态码异常: {response.status} {response.reason}"
+                    return self._format_error_response(response, error_msg, raw_content)
+                
+                try:
+                    json_data = json.loads(raw_content)
+                    if not all(field in json_data for field in ["status", "retcode"]):
+                        raise ValueError("缺少必要字段")
+                        
+                    return self._format_success_response(response, json_data)
+                    
+                except (json.JSONDecodeError, ValueError) as e:
+                    error_msg = f"响应解析失败: {str(e)}"
+                    return self._format_error_response(response, error_msg, raw_content)
+                    
         except aiohttp.ClientError as e:
             error_msg = f"网络请求失败: {str(e)}"
             logger.error(error_msg)
-            return {
-                "success": False,
-                "message": error_msg,
-                "raw_response": None
-            }
+            return {"success": False, "message": error_msg}
         except Exception as e:
             error_msg = f"请求处理异常: {str(e)}"
             logger.error(error_msg)
-            return {
-                "success": False,
-                "message": error_msg,
-                "raw_response": None
-            }
+            return {"success": False, "message": error_msg}
+
+    def _format_success_response(self, response, json_data):
+        """格式化成功响应"""
+        result = {
+            "success": True,
+            "status_code": response.status,
+            "data": json_data
+        }
+        if self.debug_mode:
+            headers_str = "\n".join(f"{k}: {v}" for k, v in response.headers.items())
+            result["raw_response"] = (
+                f"HTTP/{response.version.major}.{response.version.minor} {response.status} {response.reason}\n"
+                f"{headers_str}\n\n"
+                f"{json.dumps(json_data, indent=2, ensure_ascii=False)}"
+            )
+        return result
+    
+    def _format_error_response(self, response, error_msg, raw_content):
+        """格式化错误响应"""
+        result = {
+            "success": False,
+            "status_code": response.status,
+            "message": error_msg
+        }
+        if self.debug_mode:
+            headers_str = "\n".join(f"{k}: {v}" for k, v in response.headers.items())
+            result["raw_response"] = (
+                f"HTTP/{response.version.major}.{response.version.minor} {response.status} {response.reason}\n"
+                f"{headers_str}\n\n"
+                f"{raw_content}"
+            )
+        return result
+    
 
     async def _sign_all_groups(self) -> str:
-        """为所有群号发送签到请求并返回结果"""
+        """并发签到所有群组"""
         if not self.group_ids:
             return "❌ 没有配置群号"
             
-        results = []
-        for group_id in self.group_ids:
-            result = await self._send_sign_request(group_id)
-            if result["success"]:
-                msg = f"✅ 群 {group_id} 签到成功"
-                if self.debug_mode and result.get("raw_response"):
-                    msg += f"\n🔍 完整响应:\n{result['raw_response']}"
-                results.append(msg)
-            else:
-                msg = f"❌ 群 {group_id} 签到失败: {result['message']}"
-                if self.debug_mode and result.get("raw_response"):
-                    msg += f"\n🔍 错误响应:\n{result['raw_response']}"
-                results.append(msg)
+        tasks = [self._send_sign_request(group_id) for group_id in self.group_ids]
+        results = await asyncio.gather(*tasks)
         
-        return "\n".join(results)
+        messages = []
+        for group_id, result in zip(self.group_ids, results):
+            status = "✅ 成功" if result["success"] else f"❌ 失败: {result['message']}"
+            msg = f"群 {group_id} 签到{status}"
+            if self.debug_mode and result.get("raw_response"):
+                msg += f"\n🔍 完整响应:\n{result['raw_response']}"
+            messages.append(msg)
+            
+        return "\n".join(messages)
 
     async def _daily_sign_task(self):
-        """每日定时签到任务"""
+        """优化的每日定时任务"""
         logger.info("每日签到任务已启动")
         
         while not self._stop_event.is_set():
             try:
                 now = self._get_local_time()
-                
-                # 计算今天的签到时间
                 target_time = now.replace(
                     hour=CONFIG["sign_time"].hour,
                     minute=CONFIG["sign_time"].minute,
@@ -222,14 +205,10 @@ class GroupSignPlugin(Star):
                     microsecond=0
                 )
                 
-                # 如果今天的时间已过，计算明天的时间
                 if now >= target_time:
                     target_time += timedelta(days=1)
                 
                 wait_seconds = (target_time - now).total_seconds()
-                logger.info(f"距离下次签到还有 {wait_seconds:.1f}秒 (将在 {target_time} 执行)")
-                
-                # 如果等待时间超过1天，可能是计算错误
                 if wait_seconds > 86400:
                     logger.warning(f"等待时间异常长: {wait_seconds}秒，重置为明天")
                     target_time = now.replace(
@@ -240,26 +219,24 @@ class GroupSignPlugin(Star):
                     ) + timedelta(days=1)
                     wait_seconds = (target_time - now).total_seconds()
                 
-                # 等待到目标时间或收到停止信号
+                logger.info(f"距离下次签到还有 {wait_seconds:.1f}秒 (将在 {target_time} 执行)")
+                
                 try:
                     await asyncio.wait_for(self._stop_event.wait(), timeout=wait_seconds)
                     if self._stop_event.is_set():
                         break
                 except asyncio.TimeoutError:
-                    pass  # 正常到达目标时间
+                    pass
                 
-                # 执行签到
                 logger.info("开始执行每日签到...")
                 result = await self._sign_all_groups()
                 logger.info(f"签到完成: {result}")
                 
-                # 短暂延迟防止CPU占用过高
-                await asyncio.sleep(1)
+                await asyncio.sleep(1)  # 防止CPU占用过高
                 
             except Exception as e:
                 logger.error(f"自动签到任务出错: {e}")
-                # 出错后等待一段时间再重试
-                await asyncio.sleep(60)
+                await asyncio.sleep(CONFIG["retry_delay"])
     
     @filter.command("debug_sign")
     async def toggle_debug_mode(self, event: AstrMessageEvent, mode: str = None):
@@ -451,16 +428,20 @@ class GroupSignPlugin(Star):
     
     
     async def terminate(self):
-        """插件终止时清理资源"""
+        """异步清理资源"""
         if self.is_active:
             self._stop_event.set()
             self.is_active = False
-            self._save_config()  # 终止前保存状态
+            await self._save_config()
             
-            if self.task:
+            if self.task and not self.task.done():
                 self.task.cancel()
                 try:
                     await self.task
                 except asyncio.CancelledError:
                     pass
+                    
+        if self._session and not self._session.closed:
+            await self._session.close()
+            
         logger.info("群签到插件已终止")
