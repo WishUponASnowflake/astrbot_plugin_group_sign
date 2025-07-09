@@ -5,154 +5,143 @@ import aiofiles
 import json
 import asyncio
 import os
-from typing import List, Union, Optional, AsyncGenerator
+from typing import List, Optional, Union
 from urllib.parse import urlparse
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star
+from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.message_components import Plain
 from astrbot.api import logger
 
 # ============= 可配置参数 =============
-PLUGIN_ROOT = Path(__file__).parent
-CONFIG = {
+DEFAULT_CONFIG = {
     "sign_time": time(0, 0, 5),  # 包含5秒延迟
     "timezone": 8,
-    "storage_file": str(PLUGIN_ROOT / "group_sign_data.json"),
     "request_timeout": 10,
     "retry_delay": 60,
-    "host":"192.168.1.50:3000"
+    "host": "192.168.1.50:3000"
 }
 
 class GroupSignPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
+        # 使用框架提供的标准数据目录
+        self.plugin_data_dir = StarTools.get_data_dir()
+        self.plugin_data_dir.mkdir(parents=True, exist_ok=True)
+        self.storage_file = self.plugin_data_dir / "group_sign_data.json"
+        
         self.task: Optional[asyncio.Task] = None
-        self.group_ids = None
-        self.is_active = None 
-        asyncio.create_task(self._async_init())
-        self.base_url = "http://"+CONFIG["host"]+"/send_group_sign"
+        self.group_ids: List[str] = []
+        self.is_active = False
+        self._stop_event = asyncio.Event()
+        self.timezone = timezone(timedelta(hours=DEFAULT_CONFIG["timezone"]))
+        self._session: Optional[aiohttp.ClientSession] = None
+        self.debug_mode = False
+        
+        self.base_url = f"http://{DEFAULT_CONFIG['host']}/send_group_sign"
         self.headers = {
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
-        self.debug_mode = False
-        self._stop_event = asyncio.Event()
-        self.timezone = timezone(timedelta(hours=CONFIG["timezone"]))
-        self._session: Optional[aiohttp.ClientSession] = None
+        
+        asyncio.create_task(self._async_init())
     
     async def _async_init(self):
         await self._load_config()
-        
-        # 准确报告来源
         logger.info(
             f"初始化完成 | is_active={self.is_active} "
             f"来源={getattr(self, '_config_source', '未设置')}"
         )
-        
         if self.is_active:
             await self._start_sign_task()
 
-    async def _get_session(self) -> aiohttp.ClientSession:
-        """获取或创建ClientSession"""
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
-        return self._session
+    def _get_next_run_time(self) -> datetime:
+        """计算下一次任务执行的本地时间"""
+        now = self._get_local_time()
+        target_time = now.replace(
+            hour=DEFAULT_CONFIG["sign_time"].hour,
+            minute=DEFAULT_CONFIG["sign_time"].minute,
+            second=DEFAULT_CONFIG["sign_time"].second,
+            microsecond=0
+        )
+        if now >= target_time:
+            target_time += timedelta(days=1)
+        return target_time
 
     async def _load_config(self):
-        """
-        异步加载配置文件（完整修复版）
-        返回值: (is_loaded: bool, source: str)
-        """
+        """异步加载配置文件"""
         default_values = {
             "group_ids": [],
             "is_active": False
         }
         
-        # 初始化标记
         self._config_source = "default"
-        loaded_data = None
         
         try:
-            # 1. 检查文件是否存在（异步友好方式）
-            file_exists = await asyncio.to_thread(os.path.exists, CONFIG["storage_file"])
-            if not file_exists:
+            if not await asyncio.to_thread(os.path.exists, self.storage_file):
                 logger.debug("配置文件不存在，使用默认值")
                 for key, value in default_values.items():
                     setattr(self, key, value)
                 return True, "default"
     
-            # 2. 异步读取文件内容
-            async with aiofiles.open(CONFIG["storage_file"], 'r', encoding='utf-8') as f:
+            async with aiofiles.open(self.storage_file, 'r', encoding='utf-8') as f:
                 try:
                     file_content = await f.read()
                     loaded_data = json.loads(file_content)
-                    logger.debug(f"文件原始内容: {file_content}")
                     
-                    # 3. 验证数据完整性
                     if not isinstance(loaded_data, dict):
-                        raise ValueError("配置文件不是有效的JSON对象")
+                        raise ValueError("配置文件根节点不是一个JSON对象")
                     
-                    # 4. 逐个字段安全更新
+                    # 确保群号统一为字符串类型
+                    if "group_ids" in loaded_data:
+                        loaded_data["group_ids"] = [str(gid) for gid in loaded_data["group_ids"]]
+                    
                     for key in default_values:
                         if key in loaded_data:
                             setattr(self, key, loaded_data[key])
-                            logger.debug(f"从文件加载 {key}={loaded_data[key]}")
                     
                     self._config_source = "file"
                     return True, "file"
                             
-                except json.JSONDecodeError as e:
+                except (json.JSONDecodeError, ValueError) as e:
                     logger.error(f"配置文件解析失败: {e}")
-                    # 创建备份防止配置丢失
-                    corrupted_file = f"{CONFIG['storage_file']}.corrupted"
-                    await asyncio.to_thread(os.rename, CONFIG["storage_file"], corrupted_file)
+                    corrupted_file = f"{self.storage_file}.corrupted"
+                    await asyncio.to_thread(os.rename, self.storage_file, corrupted_file)
                     logger.warning(f"已备份损坏文件到: {corrupted_file}")
         
         except Exception as e:
             logger.error(f"加载配置异常: {str(e)}", exc_info=True)
         
-        # 5. 降级处理：使用默认值
+        # 降级处理：使用默认值
         for key, value in default_values.items():
-            if getattr(self, key, None) is None:  # 只填充未被设置的字段
+            if getattr(self, key, None) is None:
                 setattr(self, key, value)
         
         logger.warning(f"使用默认配置 | is_active={self.is_active}")
         return False, "default"
 
-    async def _save_config(self):
+    async def _save_config(self) -> bool:
         """原子性异步保存配置"""
+        temp_path = f"{self.storage_file}.tmp"
+        data = {
+            "group_ids": self.group_ids,
+            "is_active": self.is_active
+        }
+        
         try:
-            # 异步创建目录（完全非阻塞）
-            try:
-                await asyncio.to_thread(os.makedirs, PLUGIN_ROOT, exist_ok=True)
-            except Exception as e:
-                logger.error(f"创建目录失败: {e}")
-                return False
-    
-            # 先写入临时文件
-            temp_path = f"{CONFIG['storage_file']}.tmp"
-            data = {
-                "group_ids": self.group_ids,
-                "is_active": self.is_active
-            }
-            
             async with aiofiles.open(temp_path, 'w', encoding='utf-8') as f:
                 await f.write(json.dumps(data, ensure_ascii=False, indent=2))
             
-            # 原子性替换文件
-            await asyncio.to_thread(os.replace, temp_path, CONFIG["storage_file"])
+            await asyncio.to_thread(os.replace, temp_path, self.storage_file)
             logger.info(f"配置已保存 | is_active={self.is_active}")
             return True
             
         except Exception as e:
             logger.error(f"保存配置失败: {e}")
-            # 清理临时文件
             try:
                 await asyncio.to_thread(os.unlink, temp_path)
             except:
                 pass
             return False
-    
 
     async def _start_sign_task(self):
         """启动签到任务"""
@@ -401,48 +390,36 @@ class GroupSignPlugin(Star):
         status = "🟢 运行中" if self.is_active else "🔴 已停止"
         
         # 计算下次签到时间
-        now = self._get_local_time()
-        target_time = now.replace(
-            hour=CONFIG["sign_time"].hour,
-            minute=CONFIG["sign_time"].minute,
-            second=CONFIG["sign_time"].second,
-            microsecond=0
-        )
-        if now >= target_time:
-            target_time += timedelta(days=1)
-        wait_seconds = (target_time - now).total_seconds()
+        target_time = self._get_next_run_time()
+        wait_seconds = (target_time - self._get_local_time()).total_seconds()
         
         # 确保所有群号都转为字符串
-        group_ids_str = ', '.join(str(gid) for gid in self.group_ids) if self.group_ids else '无'
+        group_ids_str = ', '.join(self.group_ids) if self.group_ids else '无'
         
         message = [
             Plain(f"{status}\n"),
-            Plain(f"⏰ 签到时间: 每天 {CONFIG['sign_time'].strftime('%H:%M:%S')} (UTC+{CONFIG['timezone']})\n"),
+            Plain(f"⏰ 签到时间: 每天 {DEFAULT_CONFIG['sign_time'].strftime('%H:%M:%S')} (UTC+{DEFAULT_CONFIG['timezone']})\n"),
             Plain(f"🔗 目标URL: {self.base_url}\n"),
             Plain(f"👥 群号列表: {group_ids_str}\n"),
             Plain(f"⏱ 下次执行: {target_time.strftime('%Y-%m-%d %H:%M:%S')}\n"),
-            Plain(f"⏳ 距离下次签到还有 {wait_seconds:.1f} 秒\n"),  # 这是修复后的正确写法
+            Plain(f"⏳ 距离下次签到还有 {wait_seconds:.1f} 秒\n"),
             Plain(f"🔧 Debug模式: {'开启' if self.debug_mode else '关闭'}")
         ]
         yield event.chain_result(message)
     
-    
-
     @filter.command("sign_add")
     async def add_group(self, event: AstrMessageEvent, group_id: str):
         """添加群号到签到列表"""
         try:
-            try:
-                group_id = int(group_id)
-            except ValueError:
-                pass
-                
+            group_id = group_id.strip()  # 确保是字符串并去除首尾空格
             if group_id not in self.group_ids:
                 self.group_ids.append(group_id)
-                self._save_config()  # 改为调用 _save_config
+                if not await self._save_config():
+                    yield event.chain_result([Plain("❌ 保存配置失败")])
+                    return
                 yield event.chain_result([Plain(
                     f"✅ 已添加群号: {group_id}\n"
-                    f"👥 当前群号列表: {', '.join(map(str, self.group_ids))}"
+                    f"👥 当前群号列表: {', '.join(self.group_ids)}"
                 )])
             else:
                 yield event.chain_result([Plain(f"ℹ️ 群号 {group_id} 已存在")])
@@ -453,17 +430,15 @@ class GroupSignPlugin(Star):
     async def remove_group(self, event: AstrMessageEvent, group_id: str):
         """从签到列表中移除群号"""
         try:
-            try:
-                group_id = int(group_id)
-            except ValueError:
-                pass
-                
+            group_id = group_id.strip()
             if group_id in self.group_ids:
                 self.group_ids.remove(group_id)
-                self._save_config()  # 改为调用 _save_config
+                if not await self._save_config():
+                    yield event.chain_result([Plain("❌ 保存配置失败")])
+                    return
                 yield event.chain_result([Plain(
                     f"✅ 已移除群号: {group_id}\n"
-                    f"👥 当前群号列表: {', '.join(map(str, self.group_ids)) if self.group_ids else '无'}"
+                    f"👥 当前群号列表: {', '.join(self.group_ids) if self.group_ids else '无'}"
                 )])
             else:
                 yield event.chain_result([Plain(f"ℹ️ 群号 {group_id} 不存在")])
@@ -498,10 +473,9 @@ class GroupSignPlugin(Star):
             error_msg = f"❌ 处理异常: {str(e)}"
             logger.error(error_msg)
             yield event.chain_result([Plain(error_msg)])
-    
-    
+
     async def terminate(self):
-        """不再强制修改状态，仅执行清理"""
+        """插件终止时执行清理"""
         self._stop_event.set()
         
         if self.task and not self.task.done():
@@ -515,4 +489,3 @@ class GroupSignPlugin(Star):
             await self._session.close()
         
         logger.info("自动签到插件已终止")
-    
