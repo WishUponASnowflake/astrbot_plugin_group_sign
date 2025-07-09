@@ -1,5 +1,5 @@
 name: "group_sign"
 author: "mmyddd"
-description: "每天0点机器人自动打卡"
+desc: "让bot定时群打卡"
 version: "1.0.0"
-repository: "https://github.com/mmyddd/astrbot_plugin_group_sign.git"
+repo:: "https://github.com/mmyddd/astrbot_plugin_group_sign.git"
