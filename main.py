@@ -55,22 +55,31 @@ class GroupSignPlugin(Star):
             os.makedirs(PLUGIN_ROOT, exist_ok=True)
             
             if os.path.exists(CONFIG["storage_file"]):
-                with open(CONFIG["storage_file"], "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    self.group_ids = data.get("group_ids", [])
-                    self.is_active = data.get("is_active", False)
-                    
-                    # 如果之前是活跃状态，则启动任务
-                    if self.is_active:
-                        asyncio.create_task(self._start_sign_task())
+                try:
+                    with open(CONFIG["storage_file"], "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        # 确保只更新存在的字段，保留其他字段不变
+                        if "group_ids" in data:
+                            self.group_ids = data["group_ids"]
+                        if "is_active" in data:  # 只有配置中存在时才更新
+                            self.is_active = data["is_active"]
+                        # 如果文件存在但缺少字段，不重置为默认值
+                except json.JSONDecodeError:
+                    logger.warning("配置文件格式错误，将使用默认值")
+                    # 这里可以选择不重置is_active，或者创建备份
+                    self._save_config()  # 重新保存当前配置
             else:
-                # 文件不存在时创建空文件
+                # 文件不存在时才初始化默认值
+                self.group_ids = []
+                self.is_active = True
                 self._save_config()
+                
+            logger.info(f"加载配置完成: group_ids={self.group_ids}, is_active={self.is_active}")
+                
         except Exception as e:
             logger.error(f"加载配置失败: {e}")
-            # 使用默认值
-            self.group_ids = []
-            self.is_active = False
+            # 这里不再重置默认值，保持当前状态
+    
     
     def _save_config(self):
         """保存配置到文件"""
