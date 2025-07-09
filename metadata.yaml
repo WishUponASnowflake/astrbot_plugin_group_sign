@@ -1,5 +1,5 @@
-name: "group_sign"
-author: "mmyddd"
-desc: "让bot定时群打卡"
-version: "1.0.0"
-repo:: "https://github.com/mmyddd/astrbot_plugin_group_sign.git"
+name: group_sign
+author: mmyddd
+desc: 让bot定时群打卡
+version: v1.0.0
+repo:: https://github.com/mmyddd/astrbot_plugin_group_sign.git
