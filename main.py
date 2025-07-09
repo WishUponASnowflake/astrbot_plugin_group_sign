@@ -41,13 +41,16 @@ class GroupSignPlugin(Star):
         self._session: Optional[aiohttp.ClientSession] = None
     
     async def _async_init(self):
-        """异步初始化"""
         await self._load_config()
-        if self.group_ids is None:
-            self.group_ids = []
-        if self.is_active is None:
-            self.is_active = False
-        logger.info(f"插件初始化完成，当前配置: {CONFIG}")
+        
+        # 准确报告来源
+        logger.info(
+            f"初始化完成 | is_active={self.is_active} "
+            f"来源={getattr(self, '_config_source', '未设置')}"
+        )
+        
+        if self.is_active:
+            await self._start_sign_task()
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """获取或创建ClientSession"""
@@ -56,61 +59,100 @@ class GroupSignPlugin(Star):
         return self._session
 
     async def _load_config(self):
-        """异步加载配置（安全增强版）"""
-        default_config = {
+        """
+        异步加载配置文件（完整修复版）
+        返回值: (is_loaded: bool, source: str)
+        """
+        default_values = {
             "group_ids": [],
-            "is_active": False  # 默认值建议与初始化一致
+            "is_active": False
         }
         
+        # 初始化标记
+        self._config_source = "default"
+        loaded_data = None
+        
         try:
-            # 确保配置目录存在（异步友好方式）
+            # 1. 检查文件是否存在（异步友好方式）
+            file_exists = await asyncio.to_thread(os.path.exists, CONFIG["storage_file"])
+            if not file_exists:
+                logger.debug("配置文件不存在，使用默认值")
+                for key, value in default_values.items():
+                    setattr(self, key, value)
+                return True, "default"
+    
+            # 2. 异步读取文件内容
+            async with aiofiles.open(CONFIG["storage_file"], 'r', encoding='utf-8') as f:
+                try:
+                    file_content = await f.read()
+                    loaded_data = json.loads(file_content)
+                    logger.debug(f"文件原始内容: {file_content}")
+                    
+                    # 3. 验证数据完整性
+                    if not isinstance(loaded_data, dict):
+                        raise ValueError("配置文件不是有效的JSON对象")
+                    
+                    # 4. 逐个字段安全更新
+                    for key in default_values:
+                        if key in loaded_data:
+                            setattr(self, key, loaded_data[key])
+                            logger.debug(f"从文件加载 {key}={loaded_data[key]}")
+                    
+                    self._config_source = "file"
+                    return True, "file"
+                            
+                except json.JSONDecodeError as e:
+                    logger.error(f"配置文件解析失败: {e}")
+                    # 创建备份防止配置丢失
+                    corrupted_file = f"{CONFIG['storage_file']}.corrupted"
+                    await asyncio.to_thread(os.rename, CONFIG["storage_file"], corrupted_file)
+                    logger.warning(f"已备份损坏文件到: {corrupted_file}")
+        
+        except Exception as e:
+            logger.error(f"加载配置异常: {str(e)}", exc_info=True)
+        
+        # 5. 降级处理：使用默认值
+        for key, value in default_values.items():
+            if getattr(self, key, None) is None:  # 只填充未被设置的字段
+                setattr(self, key, value)
+        
+        logger.warning(f"使用默认配置 | is_active={self.is_active}")
+        return False, "default"
+
+    async def _save_config(self):
+        """原子性异步保存配置"""
+        try:
+            # 异步创建目录（完全非阻塞）
             try:
                 await asyncio.to_thread(os.makedirs, PLUGIN_ROOT, exist_ok=True)
             except Exception as e:
                 logger.error(f"创建目录失败: {e}")
+                return False
     
-            # 异步读取配置文件
-            if await asyncio.to_thread(os.path.exists, CONFIG["storage_file"]):
-                async with aiofiles.open(CONFIG["storage_file"], mode='r', encoding='utf-8') as f:
-                    try:
-                        file_config = json.loads(await f.read())
-                        # 安全更新属性（仅覆盖存在的配置项）
-                        for key in default_config:
-                            if key in file_config:
-                                setattr(self, key, file_config[key])
-                                logger.debug(f"从配置加载: {key}={file_config[key]}")
-                    except json.JSONDecodeError as e:
-                        logger.error(f"配置文件解析失败，使用默认值: {e}")
-                        # 创建备份防止配置丢失
-                        corrupted_file = f"{CONFIG['storage_file']}.corrupted"
-                        await asyncio.to_thread(os.rename, CONFIG["storage_file"], corrupted_file)
-                        logger.warning(f"已备份损坏文件到: {corrupted_file}")
-        except Exception as e:
-            logger.error(f"配置加载异常: {e}")
-        
-        # 确保所有关键属性都有值（双重保障）
-        for key, default in default_config.items():
-            if getattr(self, key, None) is None:
-                setattr(self, key, default)
-                logger.debug(f"设置默认值: {key}={default}")
-    
-        # 调试用日志
-        logger.info(f"最终加载配置: group_ids={self.group_ids}, is_active={self.is_active}")
-    
-
-    async def _save_config(self):
-        """异步保存配置"""
-        try:
-            os.makedirs(PLUGIN_ROOT, exist_ok=True)
+            # 先写入临时文件
+            temp_path = f"{CONFIG['storage_file']}.tmp"
             data = {
                 "group_ids": self.group_ids,
                 "is_active": self.is_active
             }
-            async with aiofiles.open(CONFIG["storage_file"], "w", encoding="utf-8") as f:
+            
+            async with aiofiles.open(temp_path, 'w', encoding='utf-8') as f:
                 await f.write(json.dumps(data, ensure_ascii=False, indent=2))
-            logger.info(f"配置已保存到: {CONFIG['storage_file']}")
+            
+            # 原子性替换文件
+            await asyncio.to_thread(os.replace, temp_path, CONFIG["storage_file"])
+            logger.info(f"配置已保存 | is_active={self.is_active}")
+            return True
+            
         except Exception as e:
             logger.error(f"保存配置失败: {e}")
+            # 清理临时文件
+            try:
+                await asyncio.to_thread(os.unlink, temp_path)
+            except:
+                pass
+            return False
+    
 
     async def _start_sign_task(self):
         """启动签到任务"""
@@ -214,7 +256,6 @@ class GroupSignPlugin(Star):
 
     async def _daily_sign_task(self):
         """优化的每日定时任务"""
-        logger.info("每日签到任务已启动")
         
         while not self._stop_event.is_set():
             try:
@@ -303,6 +344,9 @@ class GroupSignPlugin(Star):
             
             # 更新状态并保存
             self.is_active = True
+            if not await self._save_config():  # 添加await和错误处理
+                yield event.chain_result([Plain("❌ 状态保存失败，请检查日志")])
+                return
             self._save_config()
             
             # 启动任务
@@ -457,20 +501,18 @@ class GroupSignPlugin(Star):
     
     
     async def terminate(self):
-        """异步清理资源"""
-        if self.is_active:
-            self._stop_event.set()
-            self.is_active = False
-            await self._save_config()
-            
-            if self.task and not self.task.done():
-                self.task.cancel()
-                try:
-                    await self.task
-                except asyncio.CancelledError:
-                    pass
-                    
+        """不再强制修改状态，仅执行清理"""
+        self._stop_event.set()
+        
+        if self.task and not self.task.done():
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+        
         if self._session and not self._session.closed:
             await self._session.close()
-            
-        logger.info("群签到插件已终止")
+        
+        logger.info("自动签到插件已终止")
+    
