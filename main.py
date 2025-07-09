@@ -27,23 +27,26 @@ class GroupSignPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.task: Optional[asyncio.Task] = None
+        self.group_ids = None
+        self.is_active = None 
+        asyncio.create_task(self._async_init())
         self.base_url = "http://"+CONFIG["host"]+"/send_group_sign"
-        self.group_ids: List[Union[str, int]] = []
         self.headers = {
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
-        self.is_active = False
         self.debug_mode = False
         self._stop_event = asyncio.Event()
         self.timezone = timezone(timedelta(hours=CONFIG["timezone"]))
         self._session: Optional[aiohttp.ClientSession] = None
-        
-        asyncio.create_task(self._async_init())
-
+    
     async def _async_init(self):
         """异步初始化"""
         await self._load_config()
+        if self.group_ids is None:
+            self.group_ids = []
+        if self.is_active is None:
+            self.is_active = False
         logger.info(f"插件初始化完成，当前配置: {CONFIG}")
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -53,29 +56,47 @@ class GroupSignPlugin(Star):
         return self._session
 
     async def _load_config(self):
-        """异步加载配置"""
+        """异步加载配置（安全增强版）"""
+        default_config = {
+            "group_ids": [],
+            "is_active": False  # 默认值建议与初始化一致
+        }
+        
         try:
-            os.makedirs(PLUGIN_ROOT, exist_ok=True)
-            
-            if os.path.exists(CONFIG["storage_file"]):
-                async with aiofiles.open(CONFIG["storage_file"], "r", encoding="utf-8") as f:
-                    data = json.loads(await f.read())
-                    if "group_ids" in data:
-                        self.group_ids = data["group_ids"]
-                    if "is_active" in data:
-                        self.is_active = data["is_active"]
-            else:
-                self.group_ids = []
-                self.is_active = True
-                await self._save_config()
-                
-            logger.info(f"配置加载完成: group_ids={self.group_ids}, is_active={self.is_active}")
-            
-            if self.is_active:
-                await self._start_sign_task()
-                
+            # 确保配置目录存在（异步友好方式）
+            try:
+                await asyncio.to_thread(os.makedirs, PLUGIN_ROOT, exist_ok=True)
+            except Exception as e:
+                logger.error(f"创建目录失败: {e}")
+    
+            # 异步读取配置文件
+            if await asyncio.to_thread(os.path.exists, CONFIG["storage_file"]):
+                async with aiofiles.open(CONFIG["storage_file"], mode='r', encoding='utf-8') as f:
+                    try:
+                        file_config = json.loads(await f.read())
+                        # 安全更新属性（仅覆盖存在的配置项）
+                        for key in default_config:
+                            if key in file_config:
+                                setattr(self, key, file_config[key])
+                                logger.debug(f"从配置加载: {key}={file_config[key]}")
+                    except json.JSONDecodeError as e:
+                        logger.error(f"配置文件解析失败，使用默认值: {e}")
+                        # 创建备份防止配置丢失
+                        corrupted_file = f"{CONFIG['storage_file']}.corrupted"
+                        await asyncio.to_thread(os.rename, CONFIG["storage_file"], corrupted_file)
+                        logger.warning(f"已备份损坏文件到: {corrupted_file}")
         except Exception as e:
-            logger.error(f"加载配置失败: {e}")
+            logger.error(f"配置加载异常: {e}")
+        
+        # 确保所有关键属性都有值（双重保障）
+        for key, default in default_config.items():
+            if getattr(self, key, None) is None:
+                setattr(self, key, default)
+                logger.debug(f"设置默认值: {key}={default}")
+    
+        # 调试用日志
+        logger.info(f"最终加载配置: group_ids={self.group_ids}, is_active={self.is_active}")
+    
 
     async def _save_config(self):
         """异步保存配置"""
@@ -334,25 +355,33 @@ class GroupSignPlugin(Star):
     async def sign_status(self, event: AstrMessageEvent):
         """查看签到服务状态"""
         status = "🟢 运行中" if self.is_active else "🔴 已停止"
-        next_run = (self._get_local_time().replace(
+        
+        # 计算下次签到时间
+        now = self._get_local_time()
+        target_time = now.replace(
             hour=CONFIG["sign_time"].hour,
             minute=CONFIG["sign_time"].minute,
             second=CONFIG["sign_time"].second,
             microsecond=0
-        ) + (timedelta(days=1) if self._get_local_time().time() > CONFIG["sign_time"] else timedelta(0))).strftime('%Y-%m-%d %H:%M:%S')
+        )
+        if now >= target_time:
+            target_time += timedelta(days=1)
+        wait_seconds = (target_time - now).total_seconds()
         
         # 确保所有群号都转为字符串
         group_ids_str = ', '.join(str(gid) for gid in self.group_ids) if self.group_ids else '无'
         
         message = [
             Plain(f"{status}\n"),
-            Plain(f"⏰ 签到时间: 每天 {CONFIG['sign_time'].strftime('%H:%M')} (UTC+{CONFIG['timezone']})\n"),
+            Plain(f"⏰ 签到时间: 每天 {CONFIG['sign_time'].strftime('%H:%M:%S')} (UTC+{CONFIG['timezone']})\n"),
             Plain(f"🔗 目标URL: {self.base_url}\n"),
             Plain(f"👥 群号列表: {group_ids_str}\n"),
-            Plain(f"⏱ 下次执行: {next_run}\n"),
+            Plain(f"⏱ 下次执行: {target_time.strftime('%Y-%m-%d %H:%M:%S')}\n"),
+            Plain(f"⏳ 距离下次签到还有 {wait_seconds:.1f} 秒\n"),  # 这是修复后的正确写法
             Plain(f"🔧 Debug模式: {'开启' if self.debug_mode else '关闭'}")
         ]
         yield event.chain_result(message)
+    
     
 
     @filter.command("sign_add")
