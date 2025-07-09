@@ -1,9 +1,9 @@
 from pathlib import Path
+from datetime import datetime, time, timedelta, timezone
 import aiohttp
 import json
 import asyncio
 import os
-from datetime import datetime, time, timedelta
 from typing import List, Union, Optional
 from urllib.parse import urlparse
 from astrbot.api.event import filter, AstrMessageEvent
@@ -15,7 +15,7 @@ from astrbot.api import logger
 PLUGIN_ROOT = Path(__file__).parent
 CONFIG = {
     # 每日签到时间 (24小时制)
-    "sign_time": time(0, 0),  # 默认中午12点
+    "sign_time": time(0, 0, 5),  # 默认中午12点
     
     # 时区配置 (东八区为+8)
     "timezone": 8,
@@ -41,7 +41,7 @@ class GroupSignPlugin(Star):
         self._stop_event = asyncio.Event()
         
         # 初始化时区
-        self.timezone = timedelta(hours=CONFIG["timezone"])
+        self.timezone = timezone(timedelta(hours=CONFIG["timezone"]))
         
         # 加载配置
         self._load_config()
@@ -98,13 +98,9 @@ class GroupSignPlugin(Star):
 
     def _get_local_time(self) -> datetime:
         """获取带时区的当前时间"""
-        return datetime.utcnow() + self.timezone
+        return datetime.now(self.timezone)
     
-
-    def _get_local_time(self) -> datetime:
-        """获取带时区的当前时间"""
-        return datetime.utcnow() + self.timezone
-
+    
     async def _send_sign_request(self, group_id: Union[str, int]):
         """发送签到请求的核心方法"""
         try:
@@ -213,7 +209,7 @@ class GroupSignPlugin(Star):
                 target_time = now.replace(
                     hour=CONFIG["sign_time"].hour,
                     minute=CONFIG["sign_time"].minute,
-                    second=0,
+                    second=CONFIG["sign_time"].second,
                     microsecond=0
                 )
                 
@@ -223,6 +219,17 @@ class GroupSignPlugin(Star):
                 
                 wait_seconds = (target_time - now).total_seconds()
                 logger.info(f"距离下次签到还有 {wait_seconds:.1f}秒 (将在 {target_time} 执行)")
+                
+                # 如果等待时间超过1天，可能是计算错误
+                if wait_seconds > 86400:
+                    logger.warning(f"等待时间异常长: {wait_seconds}秒，重置为明天")
+                    target_time = now.replace(
+                        hour=CONFIG["sign_time"].hour,
+                        minute=CONFIG["sign_time"].minute,
+                        second=CONFIG["sign_time"].second,
+                        microsecond=0
+                    ) + timedelta(days=1)
+                    wait_seconds = (target_time - now).total_seconds()
                 
                 # 等待到目标时间或收到停止信号
                 try:
@@ -297,7 +304,7 @@ class GroupSignPlugin(Star):
             next_run = (self._get_local_time().replace(
                 hour=CONFIG["sign_time"].hour,
                 minute=CONFIG["sign_time"].minute,
-                second=0,
+                second=CONFIG["sign_time"].second,
                 microsecond=0
             ) + (timedelta(days=1) if self._get_local_time().time() > CONFIG["sign_time"] else timedelta(0)))
             
@@ -319,17 +326,23 @@ class GroupSignPlugin(Star):
         if self.is_active:
             self._stop_event.set()
             self.is_active = False
-            self._save_config()  # 保存状态
+            self._save_config()
             
             if self.task:
                 self.task.cancel()
                 try:
                     await self.task
                 except asyncio.CancelledError:
-                    pass
+                    logger.info("自动签到任务已取消")
+                except Exception as e:
+                    logger.error(f"取消任务时出错: {e}")
+                finally:
+                    self.task = None
+                    
             yield event.chain_result([Plain("🛑 已停止自动签到服务")])
         else:
             yield event.chain_result([Plain("ℹ️ 自动签到服务未在运行中")])
+    
 
     @filter.command("sign_status")
     async def sign_status(self, event: AstrMessageEvent):
@@ -338,7 +351,7 @@ class GroupSignPlugin(Star):
         next_run = (self._get_local_time().replace(
             hour=CONFIG["sign_time"].hour,
             minute=CONFIG["sign_time"].minute,
-            second=0,
+            second=CONFIG["sign_time"].second,
             microsecond=0
         ) + (timedelta(days=1) if self._get_local_time().time() > CONFIG["sign_time"] else timedelta(0))).strftime('%Y-%m-%d %H:%M:%S')
         
@@ -367,7 +380,7 @@ class GroupSignPlugin(Star):
                 
             if group_id not in self.group_ids:
                 self.group_ids.append(group_id)
-                self._save_group_ids()  # 持久化保存
+                self._save_config()  # 改为调用 _save_config
                 yield event.chain_result([Plain(
                     f"✅ 已添加群号: {group_id}\n"
                     f"👥 当前群号列表: {', '.join(map(str, self.group_ids))}"
@@ -388,7 +401,7 @@ class GroupSignPlugin(Star):
                 
             if group_id in self.group_ids:
                 self.group_ids.remove(group_id)
-                self._save_group_ids()  # 持久化保存
+                self._save_config()  # 改为调用 _save_config
                 yield event.chain_result([Plain(
                     f"✅ 已移除群号: {group_id}\n"
                     f"👥 当前群号列表: {', '.join(map(str, self.group_ids)) if self.group_ids else '无'}"
