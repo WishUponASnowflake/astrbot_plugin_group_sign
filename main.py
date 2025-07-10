@@ -13,8 +13,8 @@ from astrbot.api.message_components import Plain
 from astrbot.api import logger
 
 # ============= 可配置参数 =============
-DEFAULT_CONFIG = {
-    "sign_time": time(0, 0, 5),  # 包含5秒延迟
+CONFIG = {
+    "sign_time": time(0, 45, 5),  # 包含5秒延迟
     "timezone": 8,
     "request_timeout": 10,
     "retry_delay": 60,
@@ -33,11 +33,11 @@ class GroupSignPlugin(Star):
         self.group_ids: List[str] = []
         self.is_active = False
         self._stop_event = asyncio.Event()
-        self.timezone = timezone(timedelta(hours=DEFAULT_CONFIG["timezone"]))
+        self.timezone = timezone(timedelta(hours=CONFIG["timezone"]))
         self._session: Optional[aiohttp.ClientSession] = None
         self.debug_mode = False
         
-        self.base_url = f"http://{DEFAULT_CONFIG['host']}/send_group_sign"
+        self.base_url = f"http://{CONFIG['host']}/send_group_sign"
         self.headers = {
             "Content-Type": "application/json",
             "Accept": "application/json"
@@ -58,9 +58,9 @@ class GroupSignPlugin(Star):
         """计算下一次任务执行的本地时间"""
         now = self._get_local_time()
         target_time = now.replace(
-            hour=DEFAULT_CONFIG["sign_time"].hour,
-            minute=DEFAULT_CONFIG["sign_time"].minute,
-            second=DEFAULT_CONFIG["sign_time"].second,
+            hour=CONFIG["sign_time"].hour,
+            minute=CONFIG["sign_time"].minute,
+            second=CONFIG["sign_time"].second,
             microsecond=0
         )
         if now >= target_time:
@@ -159,39 +159,54 @@ class GroupSignPlugin(Star):
         logger.debug(f"发送签到请求到 {self.base_url}，数据: {json.dumps(post_data)}")
         
         try:
-            session = await self._get_session()
-            async with session.post(
+            # 确保session存在
+            if self._session is None or self._session.closed:
+                self._session = aiohttp.ClientSession()
+            
+            # 添加详细的请求日志
+            logger.debug(f"准备发送请求到: {self.base_url}")
+            logger.debug(f"请求头: {self.headers}")
+            logger.debug(f"请求体: {post_data}")
+    
+            async with self._session.post(
                 url=self.base_url,
                 json=post_data,
                 headers=self.headers,
                 timeout=aiohttp.ClientTimeout(total=CONFIG["request_timeout"])
             ) as response:
+                # 获取原始响应内容
                 raw_content = await response.text()
+                logger.debug(f"收到响应: {response.status} {raw_content}")
                 
                 if response.status != 200:
                     error_msg = f"HTTP状态码异常: {response.status} {response.reason}"
+                    logger.error(f"{error_msg}, 响应内容: {raw_content}")
                     return self._format_error_response(response, error_msg, raw_content)
                 
                 try:
                     json_data = json.loads(raw_content)
+                    logger.debug(f"解析后的JSON: {json_data}")
+                    
+                    # 检查必要字段
                     if not all(field in json_data for field in ["status", "retcode"]):
-                        raise ValueError("缺少必要字段")
+                        raise ValueError("响应缺少必要字段(status/retcode)")
                         
                     return self._format_success_response(response, json_data)
                     
                 except (json.JSONDecodeError, ValueError) as e:
                     error_msg = f"响应解析失败: {str(e)}"
+                    logger.error(f"{error_msg}, 原始响应: {raw_content}")
                     return self._format_error_response(response, error_msg, raw_content)
                     
         except aiohttp.ClientError as e:
             error_msg = f"网络请求失败: {str(e)}"
-            logger.error(error_msg)
+            logger.error(error_msg, exc_info=True)
             return {"success": False, "message": error_msg}
         except Exception as e:
             error_msg = f"请求处理异常: {str(e)}"
-            logger.error(error_msg)
+            logger.error(error_msg, exc_info=True)
             return {"success": False, "message": error_msg}
-
+    
     def _format_success_response(self, response, json_data):
         """格式化成功响应"""
         result = {
@@ -398,7 +413,7 @@ class GroupSignPlugin(Star):
         
         message = [
             Plain(f"{status}\n"),
-            Plain(f"⏰ 签到时间: 每天 {DEFAULT_CONFIG['sign_time'].strftime('%H:%M:%S')} (UTC+{DEFAULT_CONFIG['timezone']})\n"),
+            Plain(f"⏰ 签到时间: 每天 {CONFIG['sign_time'].strftime('%H:%M:%S')} (UTC+{CONFIG['timezone']})\n"),
             Plain(f"🔗 目标URL: {self.base_url}\n"),
             Plain(f"👥 群号列表: {group_ids_str}\n"),
             Plain(f"⏱ 下次执行: {target_time.strftime('%Y-%m-%d %H:%M:%S')}\n"),
@@ -449,6 +464,9 @@ class GroupSignPlugin(Star):
     async def trigger_sign_now(self, event: AstrMessageEvent, group_ids: str = None):
         """立即执行签到（使用原生消息接口）"""
         try:
+            # 添加调试信息
+            logger.info(f"收到立即签到请求，参数: {group_ids}")
+            
             # 1. 处理群号列表
             target_groups = []
             if group_ids:
@@ -457,21 +475,24 @@ class GroupSignPlugin(Star):
                 target_groups = [str(gid) for gid in self.group_ids]
             
             if not target_groups:
+                logger.warning("没有可用的群号配置")
                 yield event.chain_result([Plain("❌ 没有可用的群号配置")])
                 return
     
             # 2. 开始处理提示
+            logger.info(f"开始处理签到请求，目标群号: {target_groups}")
             yield event.chain_result([Plain("🔄 正在处理签到请求...")])
     
             # 3. 发送每个结果
             for group_id in target_groups:
                 result = await self._send_sign_request(group_id)
                 status = "✅ 成功" if result["success"] else f"❌ 失败: {result['message']}"
+                logger.info(f"群 {group_id} 签到结果: {status}")
                 yield event.chain_result([Plain(f"群 {group_id} 签到{status}")])
     
         except Exception as e:
             error_msg = f"❌ 处理异常: {str(e)}"
-            logger.error(error_msg)
+            logger.error(error_msg, exc_info=True)
             yield event.chain_result([Plain(error_msg)])
 
     async def terminate(self):
