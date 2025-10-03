@@ -287,23 +287,29 @@ class GroupSignPlugin(Star):
                 logger.error(f"自动签到任务出错: {e}")
                 await asyncio.sleep(CONFIG["retry_delay"])
 
-    @filter.command("debug_sign")
-    async def toggle_debug_mode(self, event: AstrMessageEvent, mode: str = None):
-        if mode:
-            if mode.lower() == "on":
-                self.debug_mode = True
-                yield event.chain_result([Plain("🔧 Debug模式已开启")])
-            elif mode.lower() == "off":
-                self.debug_mode = False
-                yield event.chain_result([Plain("🔧 Debug模式已关闭")])
-            else:
-                yield event.chain_result([Plain("❌ 参数错误，请使用 on/off")])
-        else:
-            self.debug_mode = not self.debug_mode
-            yield event.chain_result([Plain(f"🔧 Debug模式已{'开启' if self.debug_mode else '关闭'}")])
+    #@filter.command("debug_sign")
+    #async def toggle_debug_mode(self, event: AstrMessageEvent, mode: str = None):
+    #    """
+    #    debug模式
+    #    """
+    #    if mode:
+    #        if mode.lower() == "on":
+    #            self.debug_mode = True
+    #            yield event.chain_result([Plain("🔧 Debug模式已开启")])
+    #        elif mode.lower() == "off":
+    #            self.debug_mode = False
+    #            yield event.chain_result([Plain("🔧 Debug模式已关闭")])
+    #        else:
+    #            yield event.chain_result([Plain("❌ 参数错误，请使用 on/off")])
+    #    else:
+    #        self.debug_mode = not self.debug_mode
+    #        yield event.chain_result([Plain(f"🔧 Debug模式已{'开启' if self.debug_mode else '关闭'}")])
 
     @filter.command("sign_start")
     async def start_auto_sign(self, event: AstrMessageEvent, group_ids: str = None):
+        """
+        开始自动大咖
+        """
         try:
             if group_ids:
                 new_groups = []
@@ -345,6 +351,9 @@ class GroupSignPlugin(Star):
 
     @filter.command("sign_stop")
     async def stop_auto_sign(self, event: AstrMessageEvent):
+        """
+        停止自动大咖
+        """
         if self.is_active:
             self._stop_event.set()
             self.is_active = False
@@ -365,6 +374,9 @@ class GroupSignPlugin(Star):
 
     @filter.command("sign_status")
     async def sign_status(self, event: AstrMessageEvent):
+        """
+        打卡插件状态
+        """
         status = "🟢 运行中" if self.is_active else "🔴 已停止"
         target_time = self._get_next_run_time()
         wait_seconds = (target_time - self._get_local_time()).total_seconds()
@@ -382,6 +394,9 @@ class GroupSignPlugin(Star):
 
     @filter.command("sign_add")
     async def add_group(self, event: AstrMessageEvent, group_id: str):
+        """
+        增加某个群组到列表中
+        """
         try:
             group_id = group_id.strip()
             if group_id not in self.group_ids:
@@ -400,6 +415,9 @@ class GroupSignPlugin(Star):
 
     @filter.command("sign_remove")
     async def remove_group(self, event: AstrMessageEvent, group_id: str):
+        """
+        移除列表中的某个群组
+        """
         try:
             group_id = group_id.strip()
             if group_id in self.group_ids:
@@ -418,6 +436,9 @@ class GroupSignPlugin(Star):
 
     @filter.command("sign_now", aliases=["签到"])
     async def trigger_sign_now(self, event: AstrMessageEvent, group_ids: str = None):
+        """
+        立刻打卡列表中的所有群
+        """
         try:
             logger.info(f"收到立即签到请求，参数: {group_ids}")
             target_groups = []
