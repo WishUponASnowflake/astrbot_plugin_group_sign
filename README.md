@@ -13,9 +13,8 @@
 
 ```python
 CONFIG = {
-    "sign_time": time(12, 0),    # 24小时制格式 time(时,分)
     "timezone": 8,               # 时区设置（东八区=+8）
-    "storage_file": "data.json"  # 数据存储路径
+    "host": "192.168.1.50:3000" #napcat http
 }
 ```
 
