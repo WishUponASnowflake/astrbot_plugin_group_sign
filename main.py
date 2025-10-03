@@ -14,7 +14,6 @@ from astrbot.api import logger
 
 # ============= 可配置参数 =============
 CONFIG = {
-    "sign_time": time(0, 45, 5),  # 包含5秒延迟
     "timezone": 8,
     "request_timeout": 10,
     "retry_delay": 60,
@@ -35,7 +34,7 @@ class GroupSignPlugin(Star):
         self.timezone = timezone(timedelta(hours=CONFIG["timezone"]))
         self._session: Optional[aiohttp.ClientSession] = None
         self.debug_mode = False
-        self.sign_time: time = CONFIG["sign_time"]
+        self.sign_time: time = time(0, 45, 5)  # 初始化默认值
         
         self.base_url = f"http://{CONFIG['host']}/send_group_sign"
         self.headers = {
@@ -71,7 +70,7 @@ class GroupSignPlugin(Star):
         default_values = {
             "group_ids": [],
             "is_active": False,
-            "sign_time": CONFIG["sign_time"].strftime("%H:%M:%S")
+            "sign_time": time(0, 45, 5).strftime("%H:%M:%S")  # 用默认值
         }
         self._config_source = "default"
         need_save = False
@@ -107,8 +106,8 @@ class GroupSignPlugin(Star):
                             try:
                                 self.sign_time = datetime.strptime(loaded_data[key], "%H:%M:%S").time()
                             except Exception:
-                                self.sign_time = CONFIG["sign_time"]
-                                loaded_data[key] = CONFIG["sign_time"].strftime("%H:%M:%S")
+                                self.sign_time = time(0, 45, 5)
+                                loaded_data[key] = time(0, 45, 5).strftime("%H:%M:%S")
                                 need_save = True
                         else:
                             setattr(self, key, loaded_data[key])
@@ -263,7 +262,7 @@ class GroupSignPlugin(Star):
                 if now >= target_time:
                     target_time += timedelta(days=1)
                 wait_seconds = (target_time - now).total_seconds()
-                if wait_seconds > 86401:
+                if wait_seconds > 86400:
                     logger.warning(f"等待时间异常长: {wait_seconds}秒，重置为明天")
                     target_time = now.replace(
                         hour=self.sign_time.hour,
@@ -289,9 +288,6 @@ class GroupSignPlugin(Star):
 
     #@filter.command("debug_sign")
     #async def toggle_debug_mode(self, event: AstrMessageEvent, mode: str = None):
-    #    """
-    #    debug模式
-    #    """
     #    if mode:
     #        if mode.lower() == "on":
     #            self.debug_mode = True
@@ -307,9 +303,7 @@ class GroupSignPlugin(Star):
 
     @filter.command("sign_start")
     async def start_auto_sign(self, event: AstrMessageEvent, group_ids: str = None):
-        """
-        开始自动打卡
-        """
+        """启动自动签到服务"""
         try:
             if group_ids:
                 new_groups = []
@@ -351,9 +345,7 @@ class GroupSignPlugin(Star):
 
     @filter.command("sign_stop")
     async def stop_auto_sign(self, event: AstrMessageEvent):
-        """
-        停止自动打卡
-        """
+        """停止自动签到服务"""
         if self.is_active:
             self._stop_event.set()
             self.is_active = False
@@ -374,9 +366,7 @@ class GroupSignPlugin(Star):
 
     @filter.command("sign_status")
     async def sign_status(self, event: AstrMessageEvent):
-        """
-        打卡插件状态
-        """
+        """查看签到服务状态和签到列表"""
         status = "🟢 运行中" if self.is_active else "🔴 已停止"
         target_time = self._get_next_run_time()
         wait_seconds = (target_time - self._get_local_time()).total_seconds()
@@ -394,9 +384,7 @@ class GroupSignPlugin(Star):
 
     @filter.command("sign_add")
     async def add_group(self, event: AstrMessageEvent, group_id: str):
-        """
-        增加某个群组到列表中
-        """
+        """添加群号到签到列表"""
         try:
             group_id = group_id.strip()
             if group_id not in self.group_ids:
@@ -415,9 +403,7 @@ class GroupSignPlugin(Star):
 
     @filter.command("sign_remove")
     async def remove_group(self, event: AstrMessageEvent, group_id: str):
-        """
-        移除列表中的某个群组
-        """
+        """从签到列表中移除群号"""
         try:
             group_id = group_id.strip()
             if group_id in self.group_ids:
@@ -436,9 +422,7 @@ class GroupSignPlugin(Star):
 
     @filter.command("sign_now", aliases=["签到"])
     async def trigger_sign_now(self, event: AstrMessageEvent, group_ids: str = None):
-        """
-        立刻打卡列表中的所有群
-        """
+        """立即执行签到（使用原生消息接口）"""
         try:
             logger.info(f"收到立即签到请求，参数: {group_ids}")
             target_groups = []
@@ -485,7 +469,6 @@ class GroupSignPlugin(Star):
             ])
         except Exception as e:
             yield event.chain_result([Plain(f"❌ 修改失败: {e}")])
-
 
     async def terminate(self):
         self._stop_event.set()
