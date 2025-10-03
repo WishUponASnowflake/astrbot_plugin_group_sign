@@ -263,7 +263,7 @@ class GroupSignPlugin(Star):
                 if now >= target_time:
                     target_time += timedelta(days=1)
                 wait_seconds = (target_time - now).total_seconds()
-                if wait_seconds > 86400:
+                if wait_seconds > 86401:
                     logger.warning(f"等待时间异常长: {wait_seconds}秒，重置为明天")
                     target_time = now.replace(
                         hour=self.sign_time.hour,
