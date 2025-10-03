@@ -26,7 +26,7 @@ CONFIG = {
 | `/sign_start` | 无 | 启动签到服务 |
 | `/sign_stop` | 无 | 停止签到服务 |
 | `/sign_now` | 无 | 立即执行签到 |
-| `/sign_time` | HH:MM(:SS) | 立即执行签到 |
+| `/sign_time` | HH:MM(:SS) | 修改签到时间 |
 
 ### 群组管理
 | 命令 | 示例 | 功能 |
@@ -51,7 +51,7 @@ CONFIG = {
 /sign_status
 
 #修改签到时间
-/sign_time
+/sign_time 00:00(:05)
 ```
 
 ## 注意事项
