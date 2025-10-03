@@ -308,7 +308,7 @@ class GroupSignPlugin(Star):
     @filter.command("sign_start")
     async def start_auto_sign(self, event: AstrMessageEvent, group_ids: str = None):
         """
-        开始自动大咖
+        开始自动打卡
         """
         try:
             if group_ids:
@@ -352,7 +352,7 @@ class GroupSignPlugin(Star):
     @filter.command("sign_stop")
     async def stop_auto_sign(self, event: AstrMessageEvent):
         """
-        停止自动大咖
+        停止自动打卡
         """
         if self.is_active:
             self._stop_event.set()
