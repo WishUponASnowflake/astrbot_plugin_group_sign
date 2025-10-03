@@ -388,7 +388,7 @@ class GroupSignPlugin(Star):
             Plain(f"👥 群号列表: {group_ids_str}\n"),
             Plain(f"⏱ 下次执行: {target_time.strftime('%Y-%m-%d %H:%M:%S')}\n"),
             Plain(f"⏳ 距离下次签到还有 {wait_seconds:.1f} 秒\n"),
-            Plain(f"🔧 Debug模式: {'开启' if self.debug_mode else '关闭'}")
+            #Plain(f"🔧 Debug模式: {'开启' if self.debug_mode else '关闭'}")
         ]
         yield event.chain_result(message)
 
