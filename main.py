@@ -14,6 +14,7 @@ from astrbot.api import logger
 
 # ============= 可配置参数 =============
 CONFIG = {
+    "sign_time": time(0, 45, 5),  # 包含5秒延迟
     "timezone": 8,
     "request_timeout": 10,
     "retry_delay": 60,
@@ -34,7 +35,7 @@ class GroupSignPlugin(Star):
         self.timezone = timezone(timedelta(hours=CONFIG["timezone"]))
         self._session: Optional[aiohttp.ClientSession] = None
         self.debug_mode = False
-        self.sign_time: time = time(0, 45, 5)  # 初始化默认值
+        self.sign_time: time = CONFIG["sign_time"]
         
         self.base_url = f"http://{CONFIG['host']}/send_group_sign"
         self.headers = {
@@ -70,7 +71,7 @@ class GroupSignPlugin(Star):
         default_values = {
             "group_ids": [],
             "is_active": False,
-            "sign_time": time(0, 45, 5).strftime("%H:%M:%S")  # 用默认值
+            "sign_time": CONFIG["sign_time"].strftime("%H:%M:%S")
         }
         self._config_source = "default"
         need_save = False
@@ -106,8 +107,8 @@ class GroupSignPlugin(Star):
                             try:
                                 self.sign_time = datetime.strptime(loaded_data[key], "%H:%M:%S").time()
                             except Exception:
-                                self.sign_time = time(0, 45, 5)
-                                loaded_data[key] = time(0, 45, 5).strftime("%H:%M:%S")
+                                self.sign_time = CONFIG["sign_time"]
+                                loaded_data[key] = CONFIG["sign_time"].strftime("%H:%M:%S")
                                 need_save = True
                         else:
                             setattr(self, key, loaded_data[key])
@@ -439,6 +440,31 @@ class GroupSignPlugin(Star):
             error_msg = f"❌ 处理异常: {str(e)}"
             logger.error(error_msg, exc_info=True)
             yield event.chain_result([Plain(error_msg)])
+
+    @filter.command("sign_time")
+    async def set_sign_time(self, event: AstrMessageEvent, sign_time_str: str):
+        """
+        修改每日签到时间，格式为 HH:MM[:SS]，如 08:30 或 08:30:05
+        """
+        try:
+            parts = [int(x) for x in sign_time_str.strip().split(":")]
+            if len(parts) == 2:
+                h, m = parts
+                s = 0
+            elif len(parts) == 3:
+                h, m, s = parts
+            else:
+                yield event.chain_result([Plain("❌ 时间格式错误，应为 HH:MM 或 HH:MM:SS")])
+                return
+            self.sign_time = time(h, m, s)
+            await self._save_config()
+            yield event.chain_result([
+                Plain(f"✅ 签到时间已修改为 {self.sign_time.strftime('%H:%M:%S')}\n"),
+                Plain("重启后生效，或立即生效于下次自动签到。")
+            ])
+        except Exception as e:
+            yield event.chain_result([Plain(f"❌ 修改失败: {e}")])
+
 
     async def terminate(self):
         self._stop_event.set()
